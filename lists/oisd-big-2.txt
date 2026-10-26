@@ -1,6 +1,6 @@
 [Adblock Plus]
 ! Title: OISD Big – Part 2 of 4
-! Entries: 58537
+! Entries: 58536
 ! Source: https://big.oisd.nl
 ! License: https://github.com/sjhgvr/oisd/blob/main/LICENSE
 ! Maintainer of original list: Stephan van Ruth
@@ -19846,7 +19846,6 @@
 ||finlesuvr.firebaseapp.com^
 ||finlesuvr.web.app^
 ||finlockmase.net^
-||finly3-neque33.cfd^
 ||finnansera-ai.live^
 ||finnews7.wordpress.com^
 ||finoinversora.com^
