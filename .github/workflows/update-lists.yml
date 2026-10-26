@@ -2,7 +2,7 @@ name: Aktualisiere OISD Big Teillisten
 
 on:
   schedule:
-    - cron: '0 0,12 * * *'
+    - cron: '0 0,8,16 * * *'
       timezone: 'Europe/Berlin'
   workflow_dispatch:
 
