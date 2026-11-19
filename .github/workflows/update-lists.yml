@@ -7,62 +7,287 @@ on:
 
 permissions:
   contents: write
+  actions: read
 
 jobs:
   update:
     runs-on: ubuntu-latest
     steps:
+      - name: Start des Jobs erfassen
+        id: job_start
+        run: echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
       - name: Repository herunterladen
         uses: actions/checkout@v7
 
       - name: Aktuelle OISD-Liste laden und aufteilen
+        id: generate
         run: python3 scripts/split_oisd.py
 
+      - name: Domain- und Dateistatistiken berechnen
+        id: analyze
+        if: steps.generate.outcome == 'success'
+        shell: bash
+        run: |
+          git add -- lists/
+          if git diff --cached --quiet; then
+            echo 'changed=false' >> "$GITHUB_OUTPUT"
+          else
+            echo 'changed=true' >> "$GITHUB_OUTPUT"
+          fi
+
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import subprocess
+
+          def rules(data):
+              return {
+                  line for line in data.decode('utf-8').splitlines()
+                  if line.startswith('||') and line.endswith('^')
+              }
+
+          def number(value):
+              return f'{value:,}'.replace(',', '.')
+
+          def signed(value):
+              return f'{value:+,}'.replace(',', '.')
+
+          def percent(old, new):
+              if not old:
+                  return '0,00 %' if not new else 'n. a.'
+              return f'{(new - old) / old * 100:+.2f} %'.replace('.', ',')
+
+          def size(value):
+              return f'{number(value)} B'
+
+          domain_rows = []
+          size_rows = []
+          commit_rows = []
+          totals = dict(old=0, new=0, added=0, removed=0, old_size=0, new_size=0)
+
+          for i in range(1, 5):
+              name = f'lists/oisd-big-{i}.txt'
+              new_bytes = Path(name).read_bytes()
+              exists = subprocess.run(
+                  ['git', 'cat-file', '-e', f'HEAD:{name}'],
+                  capture_output=True
+              ).returncode == 0
+              old_bytes = subprocess.check_output(
+                  ['git', 'show', f'HEAD:{name}']
+              ) if exists else b''
+
+              old_rules = rules(old_bytes)
+              new_rules = rules(new_bytes)
+              old_count, new_count = len(old_rules), len(new_rules)
+              added = len(new_rules - old_rules)
+              removed = len(old_rules - new_rules)
+              net = added - removed
+              old_size, new_size = len(old_bytes), len(new_bytes)
+
+              totals['old'] += old_count
+              totals['new'] += new_count
+              totals['added'] += added
+              totals['removed'] += removed
+              totals['old_size'] += old_size
+              totals['new_size'] += new_size
+
+              domain_rows.append(
+                  f'| Part {i} | {number(old_count)} | {number(new_count)} | '
+                  f'+{number(added)} | -{number(removed)} | {signed(net)} | '
+                  f'{percent(old_count, new_count)} |'
+              )
+              size_rows.append(
+                  f'| Part {i} | {size(old_size)} | {size(new_size)} | '
+                  f'{signed(new_size - old_size)} B |'
+              )
+              commit_rows.append(
+                  f'Part {i}: +{number(added)} neu | -{number(removed)} entfernt | '
+                  f'Netto {signed(net)} ({percent(old_count, new_count)})'
+              )
+
+          net_total = totals['added'] - totals['removed']
+          total_percent = percent(totals['old'], totals['new'])
+          domain_rows.append(
+              f"| **Gesamt** | **{number(totals['old'])}** | **{number(totals['new'])}** | "
+              f"**+{number(totals['added'])}** | **-{number(totals['removed'])}** | "
+              f'**{signed(net_total)}** | **{total_percent}** |'
+          )
+          size_rows.append(
+              f"| **Gesamt** | **{size(totals['old_size'])}** | "
+              f"**{size(totals['new_size'])}** | "
+              f"**{signed(totals['new_size'] - totals['old_size'])} B** |"
+          )
+
+          report = '\n'.join([
+              '### Domain-Veränderungen',
+              '',
+              '| Liste | Vorher | Nachher | Neu | Entfernt | Netto | Netto in % |',
+              '|---|---:|---:|---:|---:|---:|---:|',
+              *domain_rows,
+              '',
+              '### Dateigrößen der TXT-Listen',
+              '',
+              '| Liste | Vorher | Nachher | Veränderung |',
+              '|---|---:|---:|---:|',
+              *size_rows,
+              '',
+          ])
+          message = '\n'.join([
+              f'Update OISD Big (netto {signed(net_total)} Domains)',
+              '',
+              *commit_rows,
+              '',
+              f"Gesamt: +{number(totals['added'])} neu | "
+              f"-{number(totals['removed'])} entfernt | "
+              f'Netto {signed(net_total)} ({total_percent})',
+              '',
+          ])
+          temp = Path(os.environ['RUNNER_TEMP'])
+          (temp / 'oisd-summary.md').write_text(report, encoding='utf-8')
+          (temp / 'oisd-commit-message.txt').write_text(message, encoding='utf-8')
+          PY
+
       - name: Neue Listen veröffentlichen
+        id: publish
+        if: steps.analyze.outputs.changed == 'true'
+        shell: bash
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -F "$RUNNER_TEMP/oisd-commit-message.txt"
+          git push
 
-          git add lists/
+      - name: Abschlussbericht erstellen
+        if: ${{ always() }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          SCHEDULE_CRON: ${{ github.event.schedule }}
+          JOB_STARTED_AT: ${{ steps.job_start.outputs.timestamp }}
+          GENERATE_OUTCOME: ${{ steps.generate.outcome }}
+          ANALYZE_OUTCOME: ${{ steps.analyze.outcome }}
+          PUBLISH_OUTCOME: ${{ steps.publish.outcome }}
+          HAS_CHANGES: ${{ steps.analyze.outputs.changed }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from datetime import datetime, timedelta, timezone
+          from pathlib import Path
+          from urllib.request import Request, urlopen
+          from zoneinfo import ZoneInfo
 
-          if ! git diff --cached --quiet; then
-            total_added=0
-            total_removed=0
+          utc = timezone.utc
+          berlin = ZoneInfo('Europe/Berlin')
 
-            for i in 1 2 3 4; do
-              file="lists/oisd-big-$i.txt"
+          def parse_timestamp(value):
+              return datetime.fromisoformat(value.replace('Z', '+00:00'))
 
-              added=$(git diff --cached -- "$file" | grep -c '^+||' || true)
-              removed=$(git diff --cached -- "$file" | grep -c '^-||' || true)
-              net=$((added - removed))
+          def local(value):
+              return value.astimezone(berlin).strftime('%d.%m.%Y %H:%M:%S %Z')
 
-              printf 'Part %d: +%d neu | -%d entfernt | Netto %+d\n' \
-                "$i" "$added" "$removed" "$net" >> changes.txt
+          def duration(seconds):
+              hours, remainder = divmod(max(0, int(seconds)), 3600)
+              minutes, seconds = divmod(remainder, 60)
+              return f'{hours} Std. {minutes} Min. {seconds} Sek.'
 
-              total_added=$((total_added + added))
-              total_removed=$((total_removed + removed))
-            done
+          job_start_text = os.getenv('JOB_STARTED_AT', '')
+          job_start = parse_timestamp(job_start_text) if job_start_text else None
+          actual_start = None
+          start_source = 'GitHub API (run_started_at)'
+          try:
+              repo = os.environ['GITHUB_REPOSITORY']
+              run_id = os.environ['GITHUB_RUN_ID']
+              request = Request(
+                  f'https://api.github.com/repos/{repo}/actions/runs/{run_id}',
+                  headers={
+                      'Accept': 'application/vnd.github+json',
+                      'Authorization': f"Bearer {os.environ['GH_TOKEN']}",
+                      'X-GitHub-Api-Version': '2022-11-28',
+                      'User-Agent': 'oisd-big-workflow-report',
+                  },
+              )
+              with urlopen(request, timeout=12) as response:
+                  value = json.load(response).get('run_started_at')
+              if value:
+                  actual_start = parse_timestamp(value)
+          except Exception:
+              pass
 
-            total_net=$((total_added - total_removed))
+          if actual_start is None:
+              actual_start = job_start or datetime.now(utc)
+              start_source = 'Erster Job-Schritt (API-Fallback)'
 
-            {
-              printf 'Update OISD Big (netto %+d)\n\n' "$total_net"
-              cat changes.txt
-              printf '\nGesamt: +%d neu | -%d entfernt | Netto %+d\n' \
-                "$total_added" "$total_removed" "$total_net"
-            } > commit-message.txt
+          now = datetime.now(utc)
+          lines = [
+              '# OISD Big – Update-Bericht',
+              '',
+              '### Zeitplan und Ausführung',
+              '',
+              '| Messwert | Ergebnis |',
+              '|---|---|',
+          ]
 
-            {
-              echo '### OISD Big Änderungen'
-              echo '```'
-              cat changes.txt
-              printf 'Gesamt: +%d neu | -%d entfernt | Netto %+d\n' \
-                "$total_added" "$total_removed" "$total_net"
-              echo '```'
-            } >> "$GITHUB_STEP_SUMMARY"
+          cron = os.getenv('SCHEDULE_CRON', '')
+          if os.getenv('EVENT_NAME') == 'schedule' and cron:
+              minute, hour, *_ = cron.split()
+              planned = actual_start.astimezone(utc).replace(
+                  hour=int(hour), minute=int(minute), second=0, microsecond=0
+              )
+              if planned > actual_start:
+                  planned -= timedelta(days=1)
+              delay = (actual_start - planned).total_seconds()
+              lines.extend([
+                  f'| Geplant (UTC) | {planned:%d.%m.%Y %H:%M:%S} UTC |',
+                  f'| Geplant (Deutschland) | {local(planned)} |',
+                  f'| **Verspätung** | **{duration(delay)}** |',
+              ])
+          else:
+              lines.append('| Auslöser | Manuell (workflow_dispatch) |')
 
-            git commit -F commit-message.txt
-            git push
-          else
-            echo 'Keine Änderungen an den Listen.'
-          fi
+          lines.extend([
+              f'| Tatsächlicher Start | {local(actual_start)} ({start_source}) |',
+              f'| Erster Job-Schritt | {local(job_start) if job_start else "Nicht verfügbar"} |',
+              f'| Laufzeit bis zum Abschlussbericht (ca.) | {duration((now - actual_start).total_seconds())} |',
+              '',
+              '### Download, Verarbeitung und Veröffentlichung',
+              '',
+              '| Schritt | Status |',
+              '|---|---|',
+          ])
+
+          generated = os.getenv('GENERATE_OUTCOME') == 'success'
+          analyzed = os.getenv('ANALYZE_OUTCOME') == 'success'
+          published = os.getenv('PUBLISH_OUTCOME') == 'success'
+          changed = os.getenv('HAS_CHANGES') == 'true'
+
+          lines.append(
+              '| Download und Aufteilung der OISD-Liste | '
+              + ('✅ Erfolgreich |' if generated else '❌ Fehlgeschlagen oder übersprungen |')
+          )
+          lines.append(
+              '| Statistik / Dateiprüfung | '
+              + ('✅ Erfolgreich |' if analyzed else '⚠️ Nicht abgeschlossen |')
+          )
+          if not generated or not analyzed:
+              status = '⏭️ Nicht veröffentlicht (vorheriger Fehler)'
+          elif not changed:
+              status = 'ℹ️ Keine Änderungen – kein Commit oder Push erforderlich'
+          elif published:
+              status = '✅ Commit erstellt und Push erfolgreich'
+          else:
+              status = '❌ Veröffentlichung fehlgeschlagen'
+          lines.append(f'| GitHub-Veröffentlichung | {status} |')
+          lines.extend(['', ''])
+
+          report = Path(os.environ['RUNNER_TEMP']) / 'oisd-summary.md'
+          if analyzed and report.exists():
+              lines.append(report.read_text(encoding='utf-8'))
+          else:
+              lines.append('Domain- und Dateistatistiken konnten nicht erstellt werden.')
+
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as f:
+              f.write('\n'.join(lines))
+          PY
