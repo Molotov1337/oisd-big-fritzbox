@@ -22,9 +22,46 @@ jobs:
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
           git add lists/
+
           if ! git diff --cached --quiet; then
-            git commit -m 'Update OISD Big split lists'
+            total_added=0
+            total_removed=0
+
+            for i in 1 2 3 4; do
+              file="lists/oisd-big-$i.txt"
+
+              added=$(git diff --cached -- "$file" | grep -c '^+||' || true)
+              removed=$(git diff --cached -- "$file" | grep -c '^-||' || true)
+              net=$((added - removed))
+
+              printf 'Part %d: +%d neu | -%d entfernt | Netto %+d\n' \
+                "$i" "$added" "$removed" "$net" >> changes.txt
+
+              total_added=$((total_added + added))
+              total_removed=$((total_removed + removed))
+            done
+
+            total_net=$((total_added - total_removed))
+
+            {
+              printf 'Update OISD Big (netto %+d)\n\n' "$total_net"
+              cat changes.txt
+              printf '\nGesamt: +%d neu | -%d entfernt | Netto %+d\n' \
+                "$total_added" "$total_removed" "$total_net"
+            } > commit-message.txt
+
+            {
+              echo '### OISD Big Änderungen'
+              echo '```'
+              cat changes.txt
+              printf 'Gesamt: +%d neu | -%d entfernt | Netto %+d\n' \
+                "$total_added" "$total_removed" "$total_net"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+
+            git commit -F commit-message.txt
             git push
           else
             echo 'Keine Änderungen an den Listen.'
